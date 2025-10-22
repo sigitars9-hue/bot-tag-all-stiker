@@ -66,13 +66,15 @@ async function messageToBuffer(sock, msg) {
   const buffer = Buffer.concat(chunks);
 
   const mimetype =
-    mediaNode.node.mimetype ||
     mediaNode.node?.mimetype ||
     (mediaNode.type === 'imageMessage' ? 'image/jpeg' :
      mediaNode.type === 'videoMessage' ? 'video/mp4' : '');
 
-  const isVideo = mediaNode.type === 'videoMessage' || /video/.test(mimetype || '');
-  const isGif = /image\/gif/i.test(mimetype || '');
+  // WA treat GIF as videoMessage with gifPlayback=true
+  const gifPlaybackFlag = Boolean(mediaNode.node?.gifPlayback);
+  const isGif = gifPlaybackFlag || /image\/gif/i.test(mimetype || '');
+  const isVideo = (mediaNode.type === 'videoMessage' || /video/.test(mimetype || '')) && !isGif;
+
   return { buffer, isVideo, isGif, mimetype };
 }
 
@@ -86,26 +88,26 @@ async function toWebpBuffer(inputBuffer, { isVideo = false } = {}) {
 
   // Skala sisi terpanjang = 512, aspect ratio tetap (tanpa paksa 1:1, tanpa pad)
   // Jika ingin padding jadi kotak, bisa tambahkan format=rgba,scale=...,pad=... (tidak dipakai di sini).
-  const scaleExpr =
-    "scale='if(gt(iw,ih),512,-2)':'if(gt(ih,iw),512,-2)':flags=lanczos:force_original_aspect_ratio=decrease";
+const scaleExpr =
+  "scale='if(gt(iw,ih),512,-2)':'if(gt(ih,iw),512,-2)':flags=lanczos:force_original_aspect_ratio=decrease";
 
-  const optsImage = [
-    '-vcodec', 'libwebp',
-    '-vf', scaleExpr,
-    '-preset', 'default',
-    '-an',
-    '-vsync', '0'
-  ];
+const optsImage = [
+  '-vcodec', 'libwebp',
+  '-vf', scaleExpr,
+  '-preset', 'default',
+  '-an',
+  '-vsync', '0'
+];
 
-  const optsVideo = [
-    '-vcodec', 'libwebp',
-    `-vf`, `${scaleExpr},fps=20`,
-    '-preset', 'default',
-    '-an',
-    '-vsync', '0',
-    '-loop', '0',
-    '-lossless', '1'
-  ];
+const optsVideo = [
+  '-vcodec', 'libwebp',
+  '-vf', `${scaleExpr},fps=20`,
+  '-preset', 'default',
+  '-an',
+  '-vsync', '0',
+  '-loop', '0',
+  '-lossless', '1'
+];
 
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
@@ -131,7 +133,6 @@ async function gifToMp4Buffer(inputBuffer) {
   const outPath = path.join(tmpDir, `gif_${Date.now()}.mp4`);
   await fs.writeFile(inPath, inputBuffer);
 
-  // Konversi GIF ke MP4 h.264 (tanpa audio) agar WhatsApp bisa gifPlayback
   const scaleExpr =
     "scale='if(gt(iw,ih),512,-2)':'if(gt(ih,iw),512,-2)':flags=lanczos:force_original_aspect_ratio=decrease";
 
@@ -157,6 +158,7 @@ async function gifToMp4Buffer(inputBuffer) {
   });
   return out;
 }
+
 
 // ─────────────── Fitur: TagAll hanya untuk Admin (tanpa baris baru) ───────────────
 async function cmdTagAll(sock, msg, textArg) {
