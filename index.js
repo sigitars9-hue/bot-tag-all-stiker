@@ -78,7 +78,7 @@ async function messageToBuffer(sock, msg) {
   return { buffer, isVideo, isGif, mimetype };
 }
 
-// ─── WEBP statis (gambar) – AR fleksibel, tanpa paksa 1:1 ───
+// WEBP statis (gambar) — square canvas 512x512, AR konten tetap
 async function toStaticWebp(inputBuffer) {
   const tmp = path.join(process.cwd(), 'tmp');
   await fs.mkdir(tmp, { recursive: true });
@@ -86,15 +86,19 @@ async function toStaticWebp(inputBuffer) {
   const outPath = path.join(tmp, `out_${Date.now()}.webp`);
   await fs.writeFile(inPath, inputBuffer);
 
-  const scaleExpr =
-    "scale='if(gt(iw,ih),512,-2)':'if(gt(ih,iw),512,-2)':flags=lanczos:force_original_aspect_ratio=decrease";
+  // 1) scale sisi terpanjang ke 512 tanpa mengubah AR
+  // 2) ubah ke RGBA agar bisa transparan
+  // 3) pad ke 512x512, center (tanpa warna, full transparan)
+  const vf =
+    "scale='if(gt(iw,ih),512,-2)':'if(gt(ih,iw),512,-2)':flags=lanczos:force_original_aspect_ratio=decrease," +
+    "format=rgba,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000";
 
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .outputOptions([
         '-vcodec', 'libwebp',
-        '-vf', scaleExpr,
-        '-q:v', '60',        // kompresi agar ukuran kecil
+        '-vf', vf,
+        '-q:v', '60',   // naikkan (70-80) kalau mau lebih kecil
         '-an',
         '-vsync', '0'
       ])
@@ -111,7 +115,7 @@ async function toStaticWebp(inputBuffer) {
   return out;
 }
 
-// ─── WEBP animasi (GIF / video) – AR fleksibel + durasi ≤ ~6s ───
+// WEBP animasi (GIF / video) — square canvas 512x512, AR konten tetap
 async function toAnimatedWebp(inputBuffer, { fps = 15, maxSec = 6 } = {}) {
   const tmp = path.join(process.cwd(), 'tmp');
   await fs.mkdir(tmp, { recursive: true });
@@ -119,19 +123,21 @@ async function toAnimatedWebp(inputBuffer, { fps = 15, maxSec = 6 } = {}) {
   const outPath = path.join(tmp, `out_${Date.now()}.webp`);
   await fs.writeFile(inPath, inputBuffer);
 
-  const scaleExpr =
-    "scale='if(gt(iw,ih),512,-2)':'if(gt(ih,iw),512,-2)':flags=lanczos:force_original_aspect_ratio=decrease";
+  const vf =
+    "scale='if(gt(iw,ih),512,-2)':'if(gt(ih,iw),512,-2)':flags=lanczos:force_original_aspect_ratio=decrease," +
+    "format=rgba,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000," +
+    `fps=${fps}`;
 
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .outputOptions([
         '-vcodec', 'libwebp',
-        '-filter:v', `${scaleExpr},fps=${fps}`,
-        '-loop', '0',        // animasi berulang
+        '-filter:v', vf,
+        '-loop', '0',
         '-an',
         '-vsync', '0',
-        '-q:v', '65',        // kompresi agar ukuran kecil (angka lebih besar = lebih kecil)
-        '-t', String(maxSec) // batasi durasi supaya muat di WA
+        '-q:v', '65',
+        '-t', String(maxSec)   // batasi durasi biar ukuran kecil & kompatibel
       ])
       .output(outPath)
       .on('end', resolve)
@@ -145,6 +151,7 @@ async function toAnimatedWebp(inputBuffer, { fps = 15, maxSec = 6 } = {}) {
   });
   return out;
 }
+
 
 // ─────────────── TagAll admin-only (tanpa baris baru) ───────────────
 async function cmdTagAll(sock, msg, textArg) {
