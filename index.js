@@ -23,10 +23,10 @@ const CMD_PREFIX = process.env.CMD_PREFIX || '!';
 const AUTH_DIR = process.env.AUTH_DIR || './auth';
 const BOT_NAME = process.env.BOT_NAME || 'YuraBot';
 
-// Invisible separator agar mention notify tanpa tampil @tag
+// Invisible separator (mention notify tanpa tampilan @)
 const INV = '\u2063'; // U+2063
 
-// ─────────────────────── Util: Parse Text ───────────────────────
+// ─────────────────────── Util: ambil teks ───────────────────────
 function getTextFromMessage(msg) {
   const m = msg.message || {};
   if (m.conversation) return m.conversation;
@@ -37,7 +37,7 @@ function getTextFromMessage(msg) {
   return '';
 }
 
-// ─────────────── Util: Ambil media (quoted/inline) → Buffer + info ───────────────
+// ───────── media → buffer + info (deteksi GIF playback) ─────────
 async function messageToBuffer(sock, msg) {
   const m = msg.message || {};
   const quoted = m?.extendedTextMessage?.contextInfo?.quotedMessage;
@@ -70,7 +70,7 @@ async function messageToBuffer(sock, msg) {
     (mediaNode.type === 'imageMessage' ? 'image/jpeg' :
      mediaNode.type === 'videoMessage' ? 'video/mp4' : '');
 
-  // WA treat GIF as videoMessage with gifPlayback=true
+  // WA sering mengirim GIF sebagai videoMessage dengan flag gifPlayback=true
   const gifPlaybackFlag = Boolean(mediaNode.node?.gifPlayback);
   const isGif = gifPlaybackFlag || /image\/gif/i.test(mimetype || '');
   const isVideo = (mediaNode.type === 'videoMessage' || /video/.test(mimetype || '')) && !isGif;
@@ -78,59 +78,12 @@ async function messageToBuffer(sock, msg) {
   return { buffer, isVideo, isGif, mimetype };
 }
 
-// ─────────────── Util: Convert buffer → WebP (stiker, fleksibel AR) ───────────────
-async function toWebpBuffer(inputBuffer, { isVideo = false } = {}) {
-  const tmpDir = path.join(process.cwd(), 'tmp');
-  await fs.mkdir(tmpDir, { recursive: true });
-  const inPath = path.join(tmpDir, `in_${Date.now()}`);
-  const outPath = path.join(tmpDir, `out_${Date.now()}.webp`);
-  await fs.writeFile(inPath, inputBuffer);
-
-  // Skala sisi terpanjang = 512, aspect ratio tetap (tanpa paksa 1:1, tanpa pad)
-  // Jika ingin padding jadi kotak, bisa tambahkan format=rgba,scale=...,pad=... (tidak dipakai di sini).
-const scaleExpr =
-  "scale='if(gt(iw,ih),512,-2)':'if(gt(ih,iw),512,-2)':flags=lanczos:force_original_aspect_ratio=decrease";
-
-const optsImage = [
-  '-vcodec', 'libwebp',
-  '-vf', scaleExpr,
-  '-preset', 'default',
-  '-an',
-  '-vsync', '0'
-];
-
-const optsVideo = [
-  '-vcodec', 'libwebp',
-  '-vf', `${scaleExpr},fps=20`,
-  '-preset', 'default',
-  '-an',
-  '-vsync', '0',
-  '-loop', '0',
-  '-lossless', '1'
-];
-
-  await new Promise((resolve, reject) => {
-    ffmpeg(inPath)
-      .outputOptions(isVideo ? optsVideo : optsImage)
-      .output(outPath)
-      .on('end', resolve)
-      .on('error', reject)
-      .run();
-  });
-
-  const out = await fs.readFile(outPath).finally(async () => {
-    await fs.unlink(inPath).catch(() => {});
-    await fs.unlink(outPath).catch(() => {});
-  });
-  return out;
-}
-
-// ─────────────── Util: Convert GIF → MP4 (gifPlayback) ───────────────
-async function gifToMp4Buffer(inputBuffer) {
-  const tmpDir = path.join(process.cwd(), 'tmp');
-  await fs.mkdir(tmpDir, { recursive: true });
-  const inPath = path.join(tmpDir, `gif_${Date.now()}.gif`);
-  const outPath = path.join(tmpDir, `gif_${Date.now()}.mp4`);
+// ─── WEBP statis (gambar) – AR fleksibel, tanpa paksa 1:1 ───
+async function toStaticWebp(inputBuffer) {
+  const tmp = path.join(process.cwd(), 'tmp');
+  await fs.mkdir(tmp, { recursive: true });
+  const inPath = path.join(tmp, `in_${Date.now()}`);
+  const outPath = path.join(tmp, `out_${Date.now()}.webp`);
   await fs.writeFile(inPath, inputBuffer);
 
   const scaleExpr =
@@ -139,13 +92,12 @@ async function gifToMp4Buffer(inputBuffer) {
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .outputOptions([
-        '-movflags', '+faststart',
-        '-pix_fmt', 'yuv420p',
-        '-vf', `${scaleExpr},fps=20`,
+        '-vcodec', 'libwebp',
+        '-vf', scaleExpr,
+        '-q:v', '60',        // kompresi agar ukuran kecil
         '-an',
-        '-r', '20'
+        '-vsync', '0'
       ])
-      .videoCodec('libx264')
       .output(outPath)
       .on('end', resolve)
       .on('error', reject)
@@ -153,14 +105,48 @@ async function gifToMp4Buffer(inputBuffer) {
   });
 
   const out = await fs.readFile(outPath).finally(async () => {
-    await fs.unlink(inPath).catch(() => {});
-    await fs.unlink(outPath).catch(() => {});
+    await fs.unlink(inPath).catch(()=>{});
+    await fs.unlink(outPath).catch(()=>{});
   });
   return out;
 }
 
+// ─── WEBP animasi (GIF / video) – AR fleksibel + durasi ≤ ~6s ───
+async function toAnimatedWebp(inputBuffer, { fps = 15, maxSec = 6 } = {}) {
+  const tmp = path.join(process.cwd(), 'tmp');
+  await fs.mkdir(tmp, { recursive: true });
+  const inPath = path.join(tmp, `in_${Date.now()}`);
+  const outPath = path.join(tmp, `out_${Date.now()}.webp`);
+  await fs.writeFile(inPath, inputBuffer);
 
-// ─────────────── Fitur: TagAll hanya untuk Admin (tanpa baris baru) ───────────────
+  const scaleExpr =
+    "scale='if(gt(iw,ih),512,-2)':'if(gt(ih,iw),512,-2)':flags=lanczos:force_original_aspect_ratio=decrease";
+
+  await new Promise((resolve, reject) => {
+    ffmpeg(inPath)
+      .outputOptions([
+        '-vcodec', 'libwebp',
+        '-filter:v', `${scaleExpr},fps=${fps}`,
+        '-loop', '0',        // animasi berulang
+        '-an',
+        '-vsync', '0',
+        '-q:v', '65',        // kompresi agar ukuran kecil (angka lebih besar = lebih kecil)
+        '-t', String(maxSec) // batasi durasi supaya muat di WA
+      ])
+      .output(outPath)
+      .on('end', resolve)
+      .on('error', reject)
+      .run();
+  });
+
+  const out = await fs.readFile(outPath).finally(async () => {
+    await fs.unlink(inPath).catch(()=>{});
+    await fs.unlink(outPath).catch(()=>{});
+  });
+  return out;
+}
+
+// ─────────────── TagAll admin-only (tanpa baris baru) ───────────────
 async function cmdTagAll(sock, msg, textArg) {
   const from = msg.key.remoteJid;
   const sender = msg.key.participant || msg.key.remoteJid;
@@ -185,9 +171,9 @@ async function cmdTagAll(sock, msg, textArg) {
     return;
   }
 
-  // TANPA baris baru: filler langsung ditempel di akhir teks (no '\n')
+  // TANPA baris baru:
   const filler = participants.map(() => INV).join('');
-  const teks = (textArg && textArg.trim().length ? textArg.trim() : 'Penting nih kak!') + filler;
+  const teks = (textArg?.trim() || 'Penting nih kak!') + filler;
 
   await sock.sendMessage(from, {
     text: teks,
@@ -195,13 +181,13 @@ async function cmdTagAll(sock, msg, textArg) {
   }, { quoted: msg });
 }
 
-// ─────────────── Fitur: Sticker ───────────────
+// ─────────────── Sticker command ───────────────
 async function cmdSticker(sock, msg) {
-  const { buffer, isVideo, isGif, mimetype } = await messageToBuffer(sock, msg);
+  const { buffer, isVideo, isGif } = await messageToBuffer(sock, msg);
   const from = msg.key.remoteJid;
 
   if (!buffer) {
-    await sock.sendMessage(from, { text: 'Reply/kirim gambar atau video dengan caption !sticker.' }, { quoted: msg });
+    await sock.sendMessage(from, { text: 'Reply/kirim gambar atau video/GIF dengan caption !sticker.' }, { quoted: msg });
     return;
   }
 
@@ -211,20 +197,15 @@ async function cmdSticker(sock, msg) {
     return;
   }
 
-  // Jika GIF → kirim sebagai GIF (video mp4 dengan gifPlayback)
-  if (isGif || /image\/gif/i.test(mimetype || '')) {
-    try {
-      const mp4 = await gifToMp4Buffer(buffer);
-      await sock.sendMessage(from, { video: mp4, gifPlayback: true }, { quoted: msg });
-      return;
-    } catch (e) {
-      // fallback ke sticker jika konversi gif gagal
-      console.error('gifToMp4 error, fallback to webp:', e);
-    }
+  // GIF/video -> sticker animasi WEBP
+  if (isGif || isVideo) {
+    const webpAnim = await toAnimatedWebp(buffer, { fps: 15, maxSec: 6 });
+    await sock.sendMessage(from, { sticker: webpAnim }, { quoted: msg });
+    return;
   }
 
-  // Gambar / Video → sticker webp (AR fleksibel)
-  const webp = await toWebpBuffer(buffer, { isVideo });
+  // Gambar -> sticker statis WEBP
+  const webp = await toStaticWebp(buffer);
   await sock.sendMessage(from, { sticker: webp }, { quoted: msg });
 }
 
@@ -232,7 +213,7 @@ async function cmdSticker(sock, msg) {
 function parseCommand(txt) {
   if (!txt || !txt.startsWith(CMD_PREFIX)) return null;
   const cut = txt.slice(CMD_PREFIX.length).trim();
-  const [cmd, ...rest] = cut.split(/\s+/);
+  const [cmd] = cut.split(/\s+/);
   const argText = cut.slice(cmd.length).trim();
   return { cmd: cmd.toLowerCase(), argText };
 }
@@ -294,7 +275,9 @@ async function start() {
           `Prefix: ${CMD_PREFIX}`,
           '',
           `• ${CMD_PREFIX}tagall [pesan]  → Mention semua (admin only, tanpa baris baru)`,
-          `• ${CMD_PREFIX}sticker (reply gambar/video/GIF) → Gambar/Video jadi stiker; GIF tetap GIF`,
+          `• ${CMD_PREFIX}sticker (reply gambar/video/GIF) →`,
+          `   - Gambar → stiker statis WEBP (AR fleksibel)`,
+          `   - GIF/Video → stiker animasi WEBP (≤ ~6s, fps 15, AR fleksibel)`,
         ].join('\n');
         await sock.sendMessage(msg.key.remoteJid, { text: help }, { quoted: msg });
       }
