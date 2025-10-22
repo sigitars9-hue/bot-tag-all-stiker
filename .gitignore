@@ -1,3 +1,28 @@
+cat > .gitignore <<'EOF'
+# Node & deps
 node_modules/
-.wwebjs_cache/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Env & credential
+.env
+.env.*
+auth/
 tmp/
+*.pid
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Builds & logs
+dist/
+build/
+logs/
+*.log
+EOF
