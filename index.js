@@ -37,7 +37,7 @@ function getTextFromMessage(msg) {
   return '';
 }
 
-// ─────────────── Util: Ambil media (quoted/inline) → Buffer ───────────────
+// ─────────────── Util: Ambil media (quoted/inline) → Buffer + info ───────────────
 async function messageToBuffer(sock, msg) {
   const m = msg.message || {};
   const quoted = m?.extendedTextMessage?.contextInfo?.quotedMessage;
@@ -55,17 +55,28 @@ async function messageToBuffer(sock, msg) {
       mediaNode = { type: 'documentMessage', node: m.documentMessage };
   }
 
-  if (!mediaNode) return { buffer: null, isVideo: false };
+  if (!mediaNode) return { buffer: null, isVideo: false, isGif: false, mimetype: '' };
 
-  const stream = await downloadContentFromMessage(mediaNode.node, mediaNode.type.replace('Message', ''));
+  const stream = await downloadContentFromMessage(
+    mediaNode.node,
+    mediaNode.type.replace('Message', '')
+  );
   const chunks = [];
   for await (const c of stream) chunks.push(c);
   const buffer = Buffer.concat(chunks);
-  const isVideo = mediaNode.type === 'videoMessage' || /video/.test(mediaNode?.node?.mimetype || '');
-  return { buffer, isVideo };
+
+  const mimetype =
+    mediaNode.node.mimetype ||
+    mediaNode.node?.mimetype ||
+    (mediaNode.type === 'imageMessage' ? 'image/jpeg' :
+     mediaNode.type === 'videoMessage' ? 'video/mp4' : '');
+
+  const isVideo = mediaNode.type === 'videoMessage' || /video/.test(mimetype || '');
+  const isGif = /image\/gif/i.test(mimetype || '');
+  return { buffer, isVideo, isGif, mimetype };
 }
 
-// ─────────────── Util: Convert buffer → WebP (stiker) ───────────────
+// ─────────────── Util: Convert buffer → WebP (stiker, fleksibel AR) ───────────────
 async function toWebpBuffer(inputBuffer, { isVideo = false } = {}) {
   const tmpDir = path.join(process.cwd(), 'tmp');
   await fs.mkdir(tmpDir, { recursive: true });
@@ -73,21 +84,25 @@ async function toWebpBuffer(inputBuffer, { isVideo = false } = {}) {
   const outPath = path.join(tmpDir, `out_${Date.now()}.webp`);
   await fs.writeFile(inPath, inputBuffer);
 
+  // Skala sisi terpanjang = 512, aspect ratio tetap (tanpa paksa 1:1, tanpa pad)
+  // Jika ingin padding jadi kotak, bisa tambahkan format=rgba,scale=...,pad=... (tidak dipakai di sini).
+  const scaleExpr =
+    "scale='if(gt(iw,ih),512,-2)':'if(gt(ih,iw),512,-2)':flags=lanczos:force_original_aspect_ratio=decrease";
+
   const optsImage = [
     '-vcodec', 'libwebp',
-    '-vf', 'scale=512:512:force_original_aspect_ratio=decrease',
+    '-vf', scaleExpr,
     '-preset', 'default',
     '-an',
-    '-vsync', '0',
-    '-s', '512:512'
+    '-vsync', '0'
   ];
+
   const optsVideo = [
     '-vcodec', 'libwebp',
-    '-vf', 'scale=512:512:force_original_aspect_ratio=decrease,fps=20',
+    `-vf`, `${scaleExpr},fps=20`,
     '-preset', 'default',
     '-an',
     '-vsync', '0',
-    '-s', '512:512',
     '-loop', '0',
     '-lossless', '1'
   ];
@@ -108,17 +123,51 @@ async function toWebpBuffer(inputBuffer, { isVideo = false } = {}) {
   return out;
 }
 
-// ─────────────── Fitur: TagAll hanya untuk Admin ───────────────
+// ─────────────── Util: Convert GIF → MP4 (gifPlayback) ───────────────
+async function gifToMp4Buffer(inputBuffer) {
+  const tmpDir = path.join(process.cwd(), 'tmp');
+  await fs.mkdir(tmpDir, { recursive: true });
+  const inPath = path.join(tmpDir, `gif_${Date.now()}.gif`);
+  const outPath = path.join(tmpDir, `gif_${Date.now()}.mp4`);
+  await fs.writeFile(inPath, inputBuffer);
+
+  // Konversi GIF ke MP4 h.264 (tanpa audio) agar WhatsApp bisa gifPlayback
+  const scaleExpr =
+    "scale='if(gt(iw,ih),512,-2)':'if(gt(ih,iw),512,-2)':flags=lanczos:force_original_aspect_ratio=decrease";
+
+  await new Promise((resolve, reject) => {
+    ffmpeg(inPath)
+      .outputOptions([
+        '-movflags', '+faststart',
+        '-pix_fmt', 'yuv420p',
+        '-vf', `${scaleExpr},fps=20`,
+        '-an',
+        '-r', '20'
+      ])
+      .videoCodec('libx264')
+      .output(outPath)
+      .on('end', resolve)
+      .on('error', reject)
+      .run();
+  });
+
+  const out = await fs.readFile(outPath).finally(async () => {
+    await fs.unlink(inPath).catch(() => {});
+    await fs.unlink(outPath).catch(() => {});
+  });
+  return out;
+}
+
+// ─────────────── Fitur: TagAll hanya untuk Admin (tanpa baris baru) ───────────────
 async function cmdTagAll(sock, msg, textArg) {
   const from = msg.key.remoteJid;
-  const sender = msg.key.participant || msg.key.remoteJid; // pengirim
+  const sender = msg.key.participant || msg.key.remoteJid;
 
   if (!from?.endsWith('@g.us')) {
     await sock.sendMessage(from, { text: 'Perintah ini hanya bisa digunakan di grup, kak 💬' }, { quoted: msg });
     return;
   }
 
-  // Ambil metadata grup & cek apakah pengirim adalah admin
   const meta = await sock.groupMetadata(from);
   const adminList = meta.participants.filter(p => p.admin === 'admin' || p.admin === 'superadmin').map(p => p.id);
 
@@ -128,15 +177,15 @@ async function cmdTagAll(sock, msg, textArg) {
     return;
   }
 
-  // Ambil semua member
   const participants = (meta.participants || []).map(p => p.id);
   if (!participants.length) {
     await sock.sendMessage(from, { text: 'Tidak ada anggota ditemukan 😕' }, { quoted: msg });
     return;
   }
 
-  const filler = participants.map(() => INV).join(' ');
-  const teks = (textArg && textArg.trim().length ? textArg.trim() : 'Penting nih kak!') + '\n' + filler;
+  // TANPA baris baru: filler langsung ditempel di akhir teks (no '\n')
+  const filler = participants.map(() => INV).join('');
+  const teks = (textArg && textArg.trim().length ? textArg.trim() : 'Penting nih kak!') + filler;
 
   await sock.sendMessage(from, {
     text: teks,
@@ -146,7 +195,7 @@ async function cmdTagAll(sock, msg, textArg) {
 
 // ─────────────── Fitur: Sticker ───────────────
 async function cmdSticker(sock, msg) {
-  const { buffer, isVideo } = await messageToBuffer(sock, msg);
+  const { buffer, isVideo, isGif, mimetype } = await messageToBuffer(sock, msg);
   const from = msg.key.remoteJid;
 
   if (!buffer) {
@@ -160,6 +209,19 @@ async function cmdSticker(sock, msg) {
     return;
   }
 
+  // Jika GIF → kirim sebagai GIF (video mp4 dengan gifPlayback)
+  if (isGif || /image\/gif/i.test(mimetype || '')) {
+    try {
+      const mp4 = await gifToMp4Buffer(buffer);
+      await sock.sendMessage(from, { video: mp4, gifPlayback: true }, { quoted: msg });
+      return;
+    } catch (e) {
+      // fallback ke sticker jika konversi gif gagal
+      console.error('gifToMp4 error, fallback to webp:', e);
+    }
+  }
+
+  // Gambar / Video → sticker webp (AR fleksibel)
   const webp = await toWebpBuffer(buffer, { isVideo });
   await sock.sendMessage(from, { sticker: webp }, { quoted: msg });
 }
@@ -229,8 +291,8 @@ async function start() {
           `*${BOT_NAME}*`,
           `Prefix: ${CMD_PREFIX}`,
           '',
-          `• ${CMD_PREFIX}tagall [pesan]  → Mention semua (admin only)`,
-          `• ${CMD_PREFIX}sticker (reply gambar/video) → Jadikan stiker`,
+          `• ${CMD_PREFIX}tagall [pesan]  → Mention semua (admin only, tanpa baris baru)`,
+          `• ${CMD_PREFIX}sticker (reply gambar/video/GIF) → Gambar/Video jadi stiker; GIF tetap GIF`,
         ].join('\n');
         await sock.sendMessage(msg.key.remoteJid, { text: help }, { quoted: msg });
       }
