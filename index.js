@@ -238,61 +238,38 @@ async function start() {
     syncFullHistory: false
   });
 
-  sock.ev.on('connection.update', (u) => {
-    const { qr, connection, lastDisconnect } = u;
-    if (qr) {
-      console.clear();
-      console.log(`[${BOT_NAME}] Scan QR berikut untuk login:`);
-      qrcode.generate(qr, { small: true });
-    }
-    if (connection === 'close') {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('Koneksi terputus:', lastDisconnect?.error, 'reconnect:', shouldReconnect);
-      if (shouldReconnect) start();
-    } else if (connection === 'open') {
-      console.log(`[${BOT_NAME}] Tersambung ✅`);
-    }
-  });
+sock.ev.on('connection.update', async (u) => {
+  const { qr, connection, lastDisconnect } = u;
 
-  sock.ev.on('creds.update', saveCreds);
+  if (qr) {
+    console.clear();
+    console.log(`[${BOT_NAME}] Scan QR berikut untuk login:`);
+    qrcode.generate(qr, { small: true });
+  }
 
-  sock.ev.on('messages.upsert', async (up) => {
-    try {
-      const msg = up.messages?.[0];
-      if (!msg || msg.key.fromMe) return;
+  if (connection === 'close') {
+    const statusCode = lastDisconnect?.error?.output?.statusCode;
+    console.log('Koneksi terputus, statusCode:', statusCode);
 
-      const txt = getTextFromMessage(msg);
-      const parsed = parseCommand(txt);
-      if (!parsed) return;
-
-      const { cmd, argText } = parsed;
-      if (cmd === 'tagall') {
-        await cmdTagAll(sock, msg, argText);
-        return;
+    // 🔥 Kalau session di-kick / device_removed → bersihkan auth
+    if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+      console.warn('Session WhatsApp sudah logout/device_removed. Menghapus folder auth…');
+      try {
+        await fs.rm(AUTH_DIR, { recursive: true, force: true });
+        console.log('Folder auth dihapus. Jalankan lagi `node index.js` untuk scan QR baru.');
+      } catch (e) {
+        console.error('Gagal hapus auth:', e);
       }
-      if (cmd === 'sticker' || cmd === 's' || cmd === 'stiker') {
-        await cmdSticker(sock, msg);
-        return;
-      }
-
-      if (cmd === 'help' || cmd === 'menu') {
-        const help = [
-          `*${BOT_NAME}*`,
-          `Prefix: ${CMD_PREFIX}`,
-          '',
-          `• ${CMD_PREFIX}tagall [pesan]  → Mention semua (admin only, tanpa baris baru)`,
-          `• ${CMD_PREFIX}sticker (reply gambar/video/GIF) →`,
-          `   - Gambar → stiker statis WEBP (AR fleksibel)`,
-          `   - GIF/Video → stiker animasi WEBP (≤ ~6s, fps 15, AR fleksibel)`,
-        ].join('\n');
-        await sock.sendMessage(msg.key.remoteJid, { text: help }, { quoted: msg });
-      }
-
-    } catch (err) {
-      console.error('messages.upsert error:', err);
+      return; // jangan auto-reconnect pakai session busuk
     }
-  });
+
+    // error lain → boleh auto reconnect
+    console.log('Reconnect otomatis…');
+    start();
+  } else if (connection === 'open') {
+    console.log(`[${BOT_NAME}] Tersambung ✅`);
+  }
+});
 }
 
 start().catch((e) => console.error('Fatal start error:', e));
